@@ -6,9 +6,14 @@
 $ErrorActionPreference = 'Stop'
 
 $AgentPanelMarker = 'agents-catalogue.ps1'
-$AgentPanelScriptPath = Join-Path $env:USERPROFILE '.herdr\agents-catalogue.ps1'
+$AgentPanelScriptPath = (Join-Path $env:USERPROFILE '.herdr\agents-catalogue.ps1')
 $AgentPanelLaunchCommand = "powershell -NoProfile -ExecutionPolicy Bypass -File '$AgentPanelScriptPath'"
 $PollSeconds = 15
+$AgentPanelHeaderRegex = 'AgentPanel\s+[0-9]{2}:[0-9]{2}'
+
+$FlagFile = Join-Path $env:USERPROFILE '.herdr\panels-hidden'
+$LedgerFile = Join-Path $env:USERPROFILE '.herdr\panel-panes.json'
+$KeepFile = Join-Path $env:USERPROFILE '.herdr\panel-keep.txt'
 
 function Invoke-HerdrCommand {
     param(
@@ -32,6 +37,127 @@ function Get-HerdrJson {
     $rawLines = Invoke-HerdrCommand -ArgList $ArgList
     $rawText = [string]::Join("`n", $rawLines)
     return $rawText | ConvertFrom-Json
+}
+
+function Get-PanelLedger {
+    if (-not (Test-Path -LiteralPath $LedgerFile -PathType Leaf)) { return @() }
+    try {
+        $raw = Get-Content -Raw -LiteralPath $LedgerFile -ErrorAction Stop
+        $json = $raw | ConvertFrom-Json -ErrorAction Stop
+        if ($null -eq $json) { return @() }
+        return @($json)
+    }
+    catch {
+        return @()
+    }
+}
+
+function Set-PanelLedger {
+    param(
+        [Parameter(Mandatory = $true)]
+        [array]$Ledger
+    )
+
+    try {
+        if ($Ledger.Count -eq 0) {
+            '[]' | Set-Content -LiteralPath $LedgerFile -Encoding ascii
+        }
+        else {
+            ($Ledger | ConvertTo-Json) | Set-Content -LiteralPath $LedgerFile -Encoding ascii
+        }
+    }
+    catch {
+        # Ignore ledger write failures
+    }
+}
+
+function Add-PanelLedgerEntry {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$PaneId
+    )
+
+    $ledger = @(Get-PanelLedger) + $PaneId
+    Set-PanelLedger -Ledger $ledger
+}
+
+function Get-KeepPaneIds {
+    if (-not (Test-Path -LiteralPath $KeepFile -PathType Leaf)) { return @() }
+    try {
+        $lines = Get-Content -LiteralPath $KeepFile -ErrorAction Stop
+        return @($lines | ForEach-Object { $_.Trim() } | Where-Object { $_.Length -gt 0 })
+    }
+    catch {
+        return @()
+    }
+}
+
+function Close-PaneQuiet {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$PaneId
+    )
+
+    try {
+        $null = & herdr pane close $PaneId 2>$null
+    }
+    catch {
+        # Ignore close failures
+    }
+}
+
+function Invoke-HiddenModeIteration {
+    # Close every pane the watcher created (from the ledger), then clear it
+    $ledger = Get-PanelLedger
+    foreach ($paneId in $ledger) {
+        if ($paneId) { Close-PaneQuiet -PaneId $paneId }
+    }
+    Set-PanelLedger -Ledger @()
+
+    # Also close any pre-ledger AgentPanel panes, except ones explicitly kept
+    $keepIds = Get-KeepPaneIds
+    try {
+        $workspaceResp = Get-HerdrJson -ArgList @('workspace', 'list')
+        $workspaces = $workspaceResp.result.workspaces
+        if ($workspaces) {
+            foreach ($workspace in $workspaces) {
+                $workspaceId = $workspace.workspace_id
+                if (-not $workspaceId) { continue }
+
+                $allPanes = $null
+                try {
+                    $allPanesResp = Get-HerdrJson -ArgList @('pane', 'list', '--workspace', $workspaceId)
+                    $allPanes = @($allPanesResp.result.panes)
+                }
+                catch {
+                    continue
+                }
+                if (-not $allPanes -or $allPanes.Count -eq 0) { continue }
+
+                foreach ($pane in $allPanes) {
+                    $paneId = $pane.pane_id
+                    if (-not $paneId) { continue }
+                    if ($keepIds -contains $paneId) { continue }
+
+                    try {
+                        $content = Invoke-HerdrCommand -ArgList @('pane', 'read', $paneId, '--lines', '40')
+                        if ($content -and ([string]::Join("`n", $content)) -match $AgentPanelHeaderRegex) {
+                            Close-PaneQuiet -PaneId $paneId
+                        }
+                    }
+                    catch {
+                        # Continue to next pane if read fails
+                    }
+                }
+            }
+        }
+    }
+    catch {
+        # Swallow errors enumerating workspaces/panes in hidden mode
+    }
+
+    $timestamp = Get-Date -Format HH:mm:ss
+    Write-Host "heartbeat $timestamp - panels hidden"
 }
 
 function Invoke-EnsureAgentPanelIteration {
@@ -78,7 +204,7 @@ function Invoke-EnsureAgentPanelIteration {
             foreach ($pane in $tabPanes) {
                 try {
                     $content = Invoke-HerdrCommand -ArgList @('pane', 'read', $pane.pane_id, '--lines', '40')
-                    if ($content -and ([string]::Join("`n", $content)) -match 'AgentPanel\s+[0-9]{2}:[0-9]{2}') {
+                    if ($content -and ([string]::Join("`n", $content)) -match $AgentPanelHeaderRegex) {
                         $panelFound = $true
                         break
                     }
@@ -93,13 +219,20 @@ function Invoke-EnsureAgentPanelIteration {
             # Create panel in this tab
             $targetPaneId = $tabPanes[0].pane_id
 
-            # Get the area width from a pane of THIS tab and compute the ratio for 49-column panel
+            # Ratio is relative to the pane BEING SPLIT, not the tab area:
+            # use the target pane's own current width so the new pane gets exactly 49.
             $ratio = 0.64
             try {
                 $layoutResp = Get-HerdrJson -ArgList @('pane', 'layout', '--pane', $targetPaneId)
-                $areaWidth = $layoutResp.result.layout.area.width
-                if ($null -ne $areaWidth -and $areaWidth -gt 0) {
-                    $ratio = [math]::Round(1 - (49 / $areaWidth), 4)
+                $targetWidth = $null
+                foreach ($lp in $layoutResp.result.layout.panes) {
+                    if ($lp.pane_id -eq $targetPaneId) { $targetWidth = $lp.rect.width; break }
+                }
+                if ($null -ne $targetWidth -and $targetWidth -gt 55) {
+                    $ratio = [math]::Round(1 - (49 / $targetWidth), 4)
+                } elseif ($null -ne $targetWidth) {
+                    # Target too narrow to host a 49-col panel; skip this tab this cycle.
+                    continue
                 }
             }
             catch {
@@ -112,6 +245,7 @@ function Invoke-EnsureAgentPanelIteration {
                 if ($newPaneId) {
                     $null = Invoke-HerdrCommand -ArgList @('pane', 'run', $newPaneId, $AgentPanelLaunchCommand)
                     $totalPanelsCreated++
+                    Add-PanelLedgerEntry -PaneId $newPaneId
                 }
             }
             catch {
@@ -127,7 +261,12 @@ function Invoke-EnsureAgentPanelIteration {
 
 while ($true) {
     try {
-        Invoke-EnsureAgentPanelIteration
+        if (Test-Path -LiteralPath $FlagFile -PathType Leaf) {
+            Invoke-HiddenModeIteration
+        }
+        else {
+            Invoke-EnsureAgentPanelIteration
+        }
     }
     catch {
         # Swallow all errors for this iteration (server down, JSON parse failure,

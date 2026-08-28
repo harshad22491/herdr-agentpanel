@@ -4,7 +4,7 @@ param([Parameter(Mandatory=$true)][string]$PaneId)
 $script:ResizeGrowsUp = $null
 
 function Read-AgentStatus {
-    $path = Join-Path $env:USERPROFILE '.herdr\agents-status.json'
+    $path = (Join-Path $env:USERPROFILE '.herdr\agents-status.json')
     if (-not (Test-Path $path)) {
         return @{}
     }
@@ -173,6 +173,11 @@ function Render-Board {
         }
     }
 
+    $flagFile = Join-Path $HOME '.herdr\panels-hidden'
+    if (Test-Path -LiteralPath $flagFile -PathType Leaf) {
+        $lines += "Panels hidden - press h here to show"
+    }
+
     Clear-Host
 
     # Render with colors
@@ -234,5 +239,28 @@ while ($true) {
         # Continue on any error
     }
 
-    Start-Sleep -Seconds 5
+    for ($i = 0; $i -lt 5; $i++) {
+        $keyAvailable = $false
+        try {
+            $keyAvailable = [console]::KeyAvailable
+        }
+        catch {
+            $keyAvailable = $false
+        }
+
+        if ($keyAvailable) {
+            $key = [console]::ReadKey($true)
+            if ($key.KeyChar -eq 'h' -or $key.KeyChar -eq 'H') {
+                $flagFile = Join-Path $HOME '.herdr\panels-hidden'
+                if (Test-Path -LiteralPath $flagFile -PathType Leaf) {
+                    Remove-Item -LiteralPath $flagFile -Force -ErrorAction SilentlyContinue
+                }
+                else {
+                    Set-Content -LiteralPath $flagFile -Value (Get-Date -Format 'u')
+                }
+            }
+        }
+
+        Start-Sleep -Seconds 1
+    }
 }

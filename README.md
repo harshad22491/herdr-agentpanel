@@ -16,6 +16,16 @@ no other dependencies.
 | `ensure-agentpanel.ps1` | The watcher. Every 15s ensures every tab of every workspace has exactly one panel (creates missing ones at exactly 49 columns), prints a heartbeat line per cycle, caps creation at 3 panels/cycle. |
 | `agents-feed.ps1` | The status board. Renders `agents-status.json` (agent name → plain-English task description) in a pane that resizes itself to fit its content (4–20 rows). Entries are removed when an agent finishes. |
 | `probe-usage.ps1` | The quota prober. Finds *idle* codex/copilot agents in Herdr panes, sends `/status` / `/usage` into their TUIs, parses the rendered percentage, and merges it into `limits.json` — which colors the panel. Hard exclusion list keeps it away from your own sessions. |
+| `watcher-plugin/` | Herdr-native autostart (herdr ≥ 0.8): a local plugin whose `workspace.created` event hook launches the watcher in a tab when the session comes up — no OS scheduler needed. `herdr plugin link <path-to-watcher-plugin>` once, done. |
+
+## Hide / show
+
+Every panel header shows `[h=hide]`: press `h` in any panel and **all** panels close everywhere
+(the watcher tracks its creations in a ledger and idles in hidden mode, heartbeating
+"panels hidden"). The status board stays behind as the restore strip — press `h` there and the
+panels rebuild within a cycle. Pairs well with
+[herdr-sidebar](https://github.com/alexarthurs/herdr-sidebar) (file explorer + git on the left
+edge; its own toggle is the `b` key / `herdr plugin action invoke open-sidebar-windows`).
 
 ## Install
 

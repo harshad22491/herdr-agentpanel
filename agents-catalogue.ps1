@@ -166,7 +166,7 @@ while ($true) {
     $plainDisplay = { param($name) return $name }
 
     Clear-Host
-    Write-Host ("AgentPanel  {0}" -f (Get-Date -Format 'HH:mm')) -ForegroundColor Cyan
+    Write-Host ("AgentPanel  {0}  [h=hide]" -f (Get-Date -Format 'HH:mm')) -ForegroundColor Cyan
     Write-WrappedSection 'AVAILABLE' $available $availableDisplay $availableColor 'Gray'
     Write-WrappedSection 'NOT AVAILABLE' $notAvailable $plainDisplay { 'DarkGray' } 'Gray'
     Write-WrappedSection 'MANAGED' $managed $plainDisplay { 'Green' } 'Green'
@@ -174,5 +174,24 @@ while ($true) {
     Write-WrappedSection 'PANE-ONLY' $pOnly $plainDisplay { 'Yellow' } 'Yellow' '[send-text]'
     Write-WrappedSection 'NO CLI' $noCli $plainDisplay { 'DarkGray' } 'DarkGray'
 
-    Start-Sleep -Seconds 60
+    for ($i = 0; $i -lt 60; $i++) {
+        $keyAvailable = $false
+        try {
+            $keyAvailable = [console]::KeyAvailable
+        }
+        catch {
+            $keyAvailable = $false
+        }
+
+        if ($keyAvailable) {
+            $key = [console]::ReadKey($true)
+            if ($key.KeyChar -eq 'h' -or $key.KeyChar -eq 'H') {
+                $flagFile = Join-Path $HOME '.herdr\panels-hidden'
+                Set-Content -LiteralPath $flagFile -Value (Get-Date -Format 'u')
+                exit
+            }
+        }
+
+        Start-Sleep -Seconds 1
+    }
 }

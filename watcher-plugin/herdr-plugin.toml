@@ -1,0 +1,11 @@
+id = "agentpanel-watcher"
+name = "AgentPanel Watcher Autostart"
+version = "0.1.0"
+description = "Starts the AgentPanel watcher in a herdr tab when the session comes up"
+min_herdr_version = "0.8.0"
+platforms = ["windows"]
+
+[[events]]
+on = "workspace.created"
+platforms = ["windows"]
+command = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "start-watcher.ps1"]

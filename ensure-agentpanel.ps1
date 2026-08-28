@@ -158,6 +158,133 @@ function Invoke-HiddenModeIteration {
 
     $timestamp = Get-Date -Format HH:mm:ss
     Write-Host "heartbeat $timestamp - panels hidden"
+
+    Invoke-EnsureStatusBoard -FallbackToFirstPane
+}
+
+function Invoke-EnsureStatusBoard {
+    param(
+        [switch]$FallbackToFirstPane
+    )
+
+    $AgentsFeedScriptPath = (Join-Path $env:USERPROFILE '.herdr\agents-feed.ps1')
+
+    try {
+        $workspaceResp = Get-HerdrJson -ArgList @('workspace', 'list')
+        $workspaces = $workspaceResp.result.workspaces
+        if (-not $workspaces) { return }
+    }
+    catch {
+        return
+    }
+
+    # Order workspaces: focused first (if the field is available), then the rest.
+    $focusedWorkspaces = @($workspaces | Where-Object { $_.focused })
+    $otherWorkspaces = @($workspaces | Where-Object { -not $_.focused })
+    $orderedWorkspaces = @($focusedWorkspaces + $otherWorkspaces)
+
+    # 1. Detection: does a status-board pane already exist anywhere?
+    foreach ($workspace in $orderedWorkspaces) {
+        $workspaceId = $workspace.workspace_id
+        if (-not $workspaceId) { continue }
+
+        $allPanes = $null
+        try {
+            $allPanesResp = Get-HerdrJson -ArgList @('pane', 'list', '--workspace', $workspaceId)
+            $allPanes = @($allPanesResp.result.panes)
+        }
+        catch {
+            continue
+        }
+        if (-not $allPanes -or $allPanes.Count -eq 0) { continue }
+
+        foreach ($pane in $allPanes) {
+            $paneId = $pane.pane_id
+            if (-not $paneId) { continue }
+            try {
+                $content = Invoke-HerdrCommand -ArgList @('pane', 'read', $paneId, '--lines', '40')
+                if ($content -and ([string]::Join("`n", $content)) -match 'TEAM ACTIVITY') {
+                    return
+                }
+            }
+            catch {
+                # Continue to next pane if read fails
+            }
+        }
+    }
+
+    # 2. No board pane found anywhere: find a home tab, wherever an AgentPanel already
+    # lives, preferring the focused workspace.
+    $panelPaneId = $null
+    foreach ($workspace in $orderedWorkspaces) {
+        if ($panelPaneId) { break }
+        $workspaceId = $workspace.workspace_id
+        if (-not $workspaceId) { continue }
+
+        $allPanes = $null
+        try {
+            $allPanesResp = Get-HerdrJson -ArgList @('pane', 'list', '--workspace', $workspaceId)
+            $allPanes = @($allPanesResp.result.panes)
+        }
+        catch {
+            continue
+        }
+        if (-not $allPanes -or $allPanes.Count -eq 0) { continue }
+
+        foreach ($pane in $allPanes) {
+            $paneId = $pane.pane_id
+            if (-not $paneId) { continue }
+            try {
+                $content = Invoke-HerdrCommand -ArgList @('pane', 'read', $paneId, '--lines', '40')
+                if ($content -and ([string]::Join("`n", $content)) -match $AgentPanelHeaderRegex) {
+                    $panelPaneId = $paneId
+                    break
+                }
+            }
+            catch {
+                # Continue to next pane if read fails
+            }
+        }
+    }
+
+    # In hidden mode there may be no panel pane at all (they were all closed above).
+    # Fall back to the first pane of the focused workspace's first tab, so the board
+    # still exists as the "restore" button.
+    if ((-not $panelPaneId) -and $FallbackToFirstPane -and $orderedWorkspaces.Count -gt 0) {
+        try {
+            $fallbackWorkspaceId = $orderedWorkspaces[0].workspace_id
+            if ($fallbackWorkspaceId) {
+                $tabResp = Get-HerdrJson -ArgList @('tab', 'list', '--workspace', $fallbackWorkspaceId)
+                $tabs = $tabResp.result.tabs
+                if ($tabs -and $tabs.Count -gt 0) {
+                    $firstTabId = $tabs[0].tab_id
+                    $allPanesResp = Get-HerdrJson -ArgList @('pane', 'list', '--workspace', $fallbackWorkspaceId)
+                    $allPanes = @($allPanesResp.result.panes)
+                    $tabPanes = @($allPanes | Where-Object { $_.tab_id -eq $firstTabId })
+                    if ($tabPanes.Count -gt 0) {
+                        $panelPaneId = $tabPanes[0].pane_id
+                    }
+                }
+            }
+        }
+        catch {
+            # Give up silently this cycle
+        }
+    }
+
+    if (-not $panelPaneId) { return }
+
+    try {
+        $splitResp = Get-HerdrJson -ArgList @('pane', 'split', $panelPaneId, '--direction', 'down', '--ratio', '0.5', '--no-focus')
+        $newPaneId = $splitResp.result.pane.pane_id
+        if ($newPaneId) {
+            $runCommand = "powershell -NoProfile -ExecutionPolicy Bypass -File '$AgentsFeedScriptPath' -PaneId $newPaneId"
+            $null = Invoke-HerdrCommand -ArgList @('pane', 'run', $newPaneId, $runCommand)
+        }
+    }
+    catch {
+        # Give up silently this cycle
+    }
 }
 
 function Invoke-EnsureAgentPanelIteration {
@@ -257,6 +384,8 @@ function Invoke-EnsureAgentPanelIteration {
     # Heartbeat at end of cycle
     $timestamp = Get-Date -Format HH:mm:ss
     Write-Host "heartbeat $timestamp - checked $totalTabsChecked tabs, created $totalPanelsCreated panels"
+
+    Invoke-EnsureStatusBoard
 }
 
 while ($true) {

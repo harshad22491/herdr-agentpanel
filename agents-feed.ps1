@@ -13,13 +13,64 @@ function Read-AgentStatus {
         $content = Get-Content -Path $path -Raw -ErrorAction Stop
         $json = ConvertFrom-Json -InputObject $content -ErrorAction Stop
         $agents = @{}
-        foreach ($prop in $json.PSObject.Properties) {
-            $agents[$prop.Name] = $prop.Value
+
+        # Check if new schema with "agents" property exists
+        if ($json.PSObject.Properties.Name -contains "agents") {
+            foreach ($prop in $json.agents.PSObject.Properties) {
+                $value = $prop.Value
+                # Handle both string and object formats
+                if ($value -is [string]) {
+                    $agents[$prop.Name] = @{ Desc = $value; Eta = $null }
+                }
+                else {
+                    $agents[$prop.Name] = @{ Desc = $value.desc; Eta = $value.eta }
+                }
+            }
+        }
+        else {
+            # Old flat format: treat each property as agent name -> description
+            foreach ($prop in $json.PSObject.Properties) {
+                $agents[$prop.Name] = @{ Desc = $prop.Value; Eta = $null }
+            }
         }
         return $agents
     }
     catch {
         return @{}
+    }
+}
+
+function Get-LiveAgents {
+    try {
+        $output = & herdr agent list 2>$null
+        if ($LASTEXITCODE -ne 0) {
+            return @()
+        }
+
+        $json = $output | ConvertFrom-Json -ErrorAction Stop
+        $liveAgents = @()
+
+        if ($json.result -and $json.result.agents) {
+            foreach ($agent in $json.result.agents) {
+                if ($agent.pane_id -eq 'w8:p2') {
+                    continue
+                }
+
+                $displayName = if ($agent.name -and $agent.name.Length -gt 0) { $agent.name } else { $agent.agent }
+
+                $liveAgents += @{
+                    DisplayName = $displayName
+                    Kind = $agent.agent
+                    Status = $agent.agent_status
+                    PaneId = $agent.pane_id
+                }
+            }
+        }
+
+        return $liveAgents
+    }
+    catch {
+        return @()
     }
 }
 
@@ -144,23 +195,71 @@ function Resize-Pane {
 
 function Render-Board {
     param(
-        [hashtable]$Agents
+        [hashtable]$ManualAgents
     )
 
     $lines = @()
     $timeStr = (Get-Date).ToString("HH:mm:ss")
     $lines += "TEAM ACTIVITY  $timeStr"
 
-    if ($Agents.Count -eq 0) {
-        $lines += "All quiet - no agents working."
+    $liveAgents = Get-LiveAgents
+
+    if ($liveAgents.Count -gt 0) {
+        foreach ($agent in $liveAgents) {
+            $displayName = $agent.DisplayName
+            $kind = $agent.Kind
+            $status = $agent.Status
+
+            $statusWord = switch ($status) {
+                "working" { "busy on a task" }
+                "idle" { "ready for a new task" }
+                "blocked" { "stuck waiting on something" }
+                "done" { "just finished a task" }
+                default { $status }
+            }
+
+            $statusText = "$displayName - $statusWord"
+            $effWidth = 45 - 2
+            $wrapped = @(Wrap-Text -Text $statusText -Width $effWidth)
+
+            for ($i = 0; $i -lt $wrapped.Count; $i++) {
+                if ($i -eq 0) {
+                    $lines += "- $($wrapped[$i])"
+                }
+                else {
+                    $lines += "  $($wrapped[$i])"
+                }
+            }
+        }
     }
-    else {
-        $sortedNames = $Agents.Keys | Sort-Object
+
+    $liveDisplayNames = @()
+    if ($liveAgents.Count -gt 0) {
+        $liveDisplayNames = $liveAgents | ForEach-Object { $_.DisplayName }
+    }
+
+    if ($ManualAgents.Count -gt 0) {
+        $sortedNames = $ManualAgents.Keys | Sort-Object
         foreach ($name in $sortedNames) {
-            $desc = $Agents[$name]
+            if ($liveDisplayNames -contains $name) {
+                continue
+            }
+
+            $agentData = $ManualAgents[$name]
+            # Handle both new format (object with Desc/Eta) and legacy string format
+            if ($agentData -is [string]) {
+                $desc = $agentData
+                $eta = $null
+            }
+            else {
+                $desc = $agentData.Desc
+                $eta = $agentData.Eta
+            }
             $effWidth = 45 - ($name.Length + 4)
             if ($effWidth -lt 20) { $effWidth = 20 }
-            $wrapped = Wrap-Text -Text $desc -Width $effWidth
+            $fullDesc = $desc
+            if ($eta) { $fullDesc = "$desc (should take $eta)" }
+            $wrapped = @(Wrap-Text -Text $fullDesc -Width $effWidth)
 
             for ($i = 0; $i -lt $wrapped.Count; $i++) {
                 if ($i -eq 0) {
@@ -171,6 +270,47 @@ function Render-Board {
                 }
             }
         }
+    }
+
+    # Render "next" task if present in JSON
+    $nextPath = (Join-Path $env:USERPROFILE '.herdr\agents-status.json')
+    if (Test-Path $nextPath) {
+        try {
+            $content = Get-Content -Path $nextPath -Raw -ErrorAction Stop
+            $json = ConvertFrom-Json -InputObject $content -ErrorAction Stop
+
+            # Check if "next" property exists and has a task
+            if ($json.PSObject.Properties.Name -contains "next" -and $json.next -and $json.next.task) {
+                $lines += "----"
+                $nextTask = $json.next.task
+                $nextAgent = $json.next.agent
+                $nextEta = $json.next.eta
+
+                # Wrap the NEXT line
+                $nextTaskWrapped = @(Wrap-Text -Text "Up next: $nextTask" -Width 45)
+                for ($i = 0; $i -lt $nextTaskWrapped.Count; $i++) {
+                    $lines += $nextTaskWrapped[$i]
+                }
+
+                # Render agent and ETA on next line
+                if ($nextAgent) {
+                    if ($nextEta) {
+                        $agentLineWrapped = @(Wrap-Text -Text "$nextAgent will handle it, expected in $nextEta" -Width 43)
+                        foreach ($al in $agentLineWrapped) { $lines += "  $al" }
+                    }
+                    else {
+                        $lines += "  -> $nextAgent"
+                    }
+                }
+            }
+        }
+        catch {
+            # Silently ignore JSON read errors
+        }
+    }
+
+    if ($liveAgents.Count -eq 0 -and $ManualAgents.Count -eq 0) {
+        $lines += "All quiet - no agents working."
     }
 
     $flagFile = Join-Path $HOME '.herdr\panels-hidden'
@@ -204,14 +344,10 @@ function Render-Board {
 while ($true) {
     try {
         $agents = Read-AgentStatus
-        $lineCount = Render-Board -Agents $agents
-        $desiredHeight = $lineCount + 3
-        if ($desiredHeight -lt 4) {
-            $desiredHeight = 4
-        }
-        if ($desiredHeight -gt 20) {
-            $desiredHeight = 20
-        }
+        $lineCount = Render-Board -ManualAgents $agents
+        # Fixed split: the board always holds half the column (user preference),
+        # panel above gets the other half.
+        $desiredHeight = 14
 
         $layout = Get-PaneLayout
         if ($layout -ne $null) {
@@ -227,6 +363,7 @@ while ($true) {
             if ($paneInfo -ne $null) {
                 $currentHeight = $paneInfo.rect.height
                 $totalHeight = $layout.result.layout.area.height
+                $desiredHeight = [Math]::Floor($totalHeight / 2)
 
                 $heightDiff = [Math]::Abs($desiredHeight - $currentHeight)
                 if ($heightDiff -ge 2) {

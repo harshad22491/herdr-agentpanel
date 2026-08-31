@@ -9,3 +9,13 @@ platforms = ["windows"]
 on = "workspace.created"
 platforms = ["windows"]
 command = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "start-watcher.ps1"]
+
+# Session restore/attach fires NO workspace.created (verified by herdr-sidebar's findings:
+# restore and client attach emit no hookable events at all). tab.focused fires on the
+# user's first interaction after attach, so the watcher comes up like the sidebar does.
+# Focus events fire in bursts; start-watcher.ps1's atomic mkdir lock + already-running
+# check serialize them.
+[[events]]
+on = "tab.focused"
+platforms = ["windows"]
+command = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "start-watcher.ps1"]

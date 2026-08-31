@@ -1,12 +1,12 @@
 # This script watches the Herdr terminal workspace manager and creates an AgentPanel pane in the first tab of every workspace if missing.
 # It polls every 15 seconds to ensure the AgentPanel is always up-to-date.
 # Detection is content-based: a pane counts as the panel if its last 12 lines contain "AgentPanel".
-# Usage: powershell -NoProfile -ExecutionPolicy Bypass -File "%USERPROFILE%\.herdr\ensure-agentpanel.ps1"
+# Usage: powershell -NoProfile -ExecutionPolicy Bypass -File "C:\Users\Harshad Vaswani\.herdr\ensure-agentpanel.ps1"
 
 $ErrorActionPreference = 'Stop'
 
 $AgentPanelMarker = 'agents-catalogue.ps1'
-$AgentPanelScriptPath = (Join-Path $env:USERPROFILE '.herdr\agents-catalogue.ps1')
+$AgentPanelScriptPath = 'C:\Users\Harshad Vaswani\.herdr\agents-catalogue.ps1'
 $AgentPanelLaunchCommand = "powershell -NoProfile -ExecutionPolicy Bypass -File '$AgentPanelScriptPath'"
 $PollSeconds = 15
 $AgentPanelHeaderRegex = 'AgentPanel\s+[0-9]{2}:[0-9]{2}'
@@ -14,6 +14,13 @@ $AgentPanelHeaderRegex = 'AgentPanel\s+[0-9]{2}:[0-9]{2}'
 $FlagFile = Join-Path $env:USERPROFILE '.herdr\panels-hidden'
 $LedgerFile = Join-Path $env:USERPROFILE '.herdr\panel-panes.json'
 $KeepFile = Join-Path $env:USERPROFILE '.herdr\panel-keep.txt'
+
+# A freshly created panel takes up to ~60s to render its first header, during which
+# content-based detection misses it and every 15s cycle would create a duplicate
+# (the "detection-miss duplicate storm" from the threat assessment). After creating
+# a panel in a tab, skip that tab for this many seconds.
+$CreationGraceSeconds = 90
+$script:RecentPanelCreations = @{}
 
 function Invoke-HerdrCommand {
     param(
@@ -167,7 +174,7 @@ function Invoke-EnsureStatusBoard {
         [switch]$FallbackToFirstPane
     )
 
-    $AgentsFeedScriptPath = (Join-Path $env:USERPROFILE '.herdr\agents-feed.ps1')
+    $AgentsFeedScriptPath = 'C:\Users\Harshad Vaswani\.herdr\agents-feed.ps1'
 
     try {
         $workspaceResp = Get-HerdrJson -ArgList @('workspace', 'list')
@@ -341,9 +348,23 @@ function Invoke-EnsureAgentPanelIteration {
                 }
             }
 
-            if ($panelFound) { continue }
+            if ($panelFound) {
+                $script:RecentPanelCreations.Remove($tabId)
+                continue
+            }
 
-            # Create panel in this tab
+            # Recently created a panel here that hasn't rendered its header yet?
+            # Give it the grace period before concluding the tab needs another.
+            if ($script:RecentPanelCreations.ContainsKey($tabId)) {
+                if (((Get-Date) - $script:RecentPanelCreations[$tabId]).TotalSeconds -lt $CreationGraceSeconds) {
+                    continue
+                }
+                $script:RecentPanelCreations.Remove($tabId)
+            }
+
+            # Create panel in this tab: split the WIDEST pane, not the first one —
+            # the first pane may be a narrow sidebar, and skipping on its width
+            # would make the watcher skip the tab forever.
             $targetPaneId = $tabPanes[0].pane_id
 
             # Ratio is relative to the pane BEING SPLIT, not the tab area:
@@ -351,14 +372,22 @@ function Invoke-EnsureAgentPanelIteration {
             $ratio = 0.64
             try {
                 $layoutResp = Get-HerdrJson -ArgList @('pane', 'layout', '--pane', $targetPaneId)
-                $targetWidth = $null
+                $tabPaneIds = @($tabPanes | ForEach-Object { $_.pane_id })
+                $widestPane = $null
                 foreach ($lp in $layoutResp.result.layout.panes) {
-                    if ($lp.pane_id -eq $targetPaneId) { $targetWidth = $lp.rect.width; break }
+                    if ($tabPaneIds -contains $lp.pane_id) {
+                        if ($null -eq $widestPane -or $lp.rect.width -gt $widestPane.rect.width) { $widestPane = $lp }
+                    }
+                }
+                $targetWidth = $null
+                if ($null -ne $widestPane) {
+                    $targetPaneId = $widestPane.pane_id
+                    $targetWidth = $widestPane.rect.width
                 }
                 if ($null -ne $targetWidth -and $targetWidth -gt 55) {
                     $ratio = [math]::Round(1 - (49 / $targetWidth), 4)
                 } elseif ($null -ne $targetWidth) {
-                    # Target too narrow to host a 49-col panel; skip this tab this cycle.
+                    # Even the widest pane is too narrow to host a 49-col panel; skip this tab this cycle.
                     continue
                 }
             }
@@ -373,6 +402,7 @@ function Invoke-EnsureAgentPanelIteration {
                     $null = Invoke-HerdrCommand -ArgList @('pane', 'run', $newPaneId, $AgentPanelLaunchCommand)
                     $totalPanelsCreated++
                     Add-PanelLedgerEntry -PaneId $newPaneId
+                    $script:RecentPanelCreations[$tabId] = Get-Date
                 }
             }
             catch {

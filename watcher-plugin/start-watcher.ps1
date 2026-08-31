@@ -1,9 +1,23 @@
-# Launcher invoked by the agentpanel-watcher herdr plugin on workspace.created.
-# Guards: atomic lock (event fires once per workspace) + already-running check.
+# Launcher invoked by the agentpanel-watcher herdr plugin on workspace.created
+# and tab.focused (the latter fires in bursts, and is what revives the watcher
+# after a session restore — restore/attach emit no workspace.created at all).
+# Guards: atomic lock with stale-break + already-running check.
 # The real watcher lives at %USERPROFILE%\.herdr\ensure-agentpanel.ps1 and runs
 # in a visible herdr tab so its heartbeat stays observable.
 
 $lockDir = Join-Path $env:USERPROFILE '.herdr\watcher-startup.lock'
+
+# Stale-lock break: a crashed invocation would otherwise hold the lock forever
+# and silently disable every future autostart. Normal holders finish in ~25s.
+try {
+    $existing = Get-Item -LiteralPath $lockDir -ErrorAction Stop
+    if (((Get-Date) - $existing.CreationTime).TotalSeconds -gt 90) {
+        Remove-Item -Path $lockDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+} catch {
+    # Lock doesn't exist; nothing to break
+}
+
 try {
     New-Item -ItemType Directory -Path $lockDir -ErrorAction Stop | Out-Null
 } catch {

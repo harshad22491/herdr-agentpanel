@@ -6,7 +6,19 @@ AI coding agents you can call and how much of their quota is left — plus a pla
 status board for a multi-agent build team.
 
 Built (and battle-tested the hard way) with PowerShell 5.1 and the `herdr` CLI only —
-no other dependencies.
+no other dependencies for the dashboard. The optional bundled sidebar is a Rust
+plugin with its own build requirements.
+
+## Project-aware sidebar
+
+`plugins/herdr-sidebar/` contains our modified version of
+[Alex Arthurs' herdr-sidebar](https://github.com/alexarthurs/herdr-sidebar).
+It automatically follows the working pane's directory on Windows and keeps
+the file explorer and Git view on the same project, including when spaces reuse
+the same name. AgentPanel utility panes do not override the project directory.
+
+See the [sidebar installation and change notes](plugins/herdr-sidebar/README.md).
+The dashboard scripts and watcher remain separate and are not replaced.
 
 ## Components
 
@@ -66,6 +78,15 @@ with mitigation — many verified by live incident. Raw per-agent assessments an
 wayfinder map are alongside it in `docs/`.
 
 ## Credits
+
+The bundled sidebar is based on **Alex Arthurs'
+[herdr-sidebar](https://github.com/alexarthurs/herdr-sidebar)**, upstream commit
+`13ebde8d631494f1273d8c5e3503a755047c1267` (0.10.0). Its source, screenshots,
+and launch scripts retain the original
+[MIT license and copyright notice](plugins/herdr-sidebar/LICENSE).
+This repository adds the project-directory-following fixes described in the
+[sidebar change notes](plugins/herdr-sidebar/UPSTREAM.md); it does not claim
+authorship of the original sidebar.
 
 Built by a multi-agent team orchestrated from Claude Code: Claude Fable (manager/reviewer),
 Claude Sonnet and Haiku subagents (build, fixes, verification), OpenAI Codex (catalogue v2,

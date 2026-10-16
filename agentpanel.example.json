@@ -1,0 +1,14 @@
+{
+  "pollSeconds": 15,
+  "heartbeatSeconds": 150,
+  "creationGraceSeconds": 90,
+  "maxCreates": 3,
+  "columns": 49,
+  "minWorkColumns": 40,
+  "limitTtlHours": 6,
+  "taskTtlMinutes": 15,
+  "completedTaskMinutes": 5,
+  "availability": {},
+  "probeAgents": {},
+  "excludedPanes": []
+}

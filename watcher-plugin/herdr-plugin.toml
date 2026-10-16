@@ -1,6 +1,6 @@
 id = "agentpanel-watcher"
 name = "AgentPanel Watcher Autostart"
-version = "0.1.0"
+version = "0.2.0"
 description = "Starts the AgentPanel watcher in a herdr tab when the session comes up"
 min_herdr_version = "0.8.0"
 platforms = ["windows"]
@@ -13,8 +13,7 @@ command = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "s
 # Session restore/attach fires NO workspace.created (verified by herdr-sidebar's findings:
 # restore and client attach emit no hookable events at all). tab.focused fires on the
 # user's first interaction after attach, so the watcher comes up like the sidebar does.
-# Focus events fire in bursts; start-watcher.ps1's atomic mkdir lock + already-running
-# check serialize them.
+# Startup and watcher lifetime mutexes prevent concurrent watchers without stale locks.
 [[events]]
 on = "tab.focused"
 platforms = ["windows"]

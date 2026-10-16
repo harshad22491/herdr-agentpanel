@@ -1,436 +1,235 @@
-# This script watches the Herdr terminal workspace manager and creates an AgentPanel pane in the first tab of every workspace if missing.
-# It polls every 15 seconds to ensure the AgentPanel is always up-to-date.
-# Detection is content-based: a pane counts as the panel if its last 12 lines contain "AgentPanel".
-# Usage: powershell -NoProfile -ExecutionPolicy Bypass -File "C:\Users\Harshad Vaswani\.herdr\ensure-agentpanel.ps1"
-
+param([string]$StateRoot = (Join-Path $env:USERPROFILE '.herdr'), [switch]$Once)
 $ErrorActionPreference = 'Stop'
-
-$AgentPanelMarker = 'agents-catalogue.ps1'
-$AgentPanelScriptPath = 'C:\Users\Harshad Vaswani\.herdr\agents-catalogue.ps1'
-$AgentPanelLaunchCommand = "powershell -NoProfile -ExecutionPolicy Bypass -File '$AgentPanelScriptPath'"
-$PollSeconds = 15
-$AgentPanelHeaderRegex = 'AgentPanel\s+[0-9]{2}:[0-9]{2}'
-
-$FlagFile = Join-Path $env:USERPROFILE '.herdr\panels-hidden'
-$LedgerFile = Join-Path $env:USERPROFILE '.herdr\panel-panes.json'
-$KeepFile = Join-Path $env:USERPROFILE '.herdr\panel-keep.txt'
-
-# A freshly created panel takes up to ~60s to render its first header, during which
-# content-based detection misses it and every 15s cycle would create a duplicate
-# (the "detection-miss duplicate storm" from the threat assessment). After creating
-# a panel in a tab, skip that tab for this many seconds.
-$CreationGraceSeconds = 90
-$script:RecentPanelCreations = @{}
-
-function Invoke-HerdrCommand {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string[]]$ArgList
-    )
-
-    $output = & herdr @ArgList
-    if ($LASTEXITCODE -ne 0) {
-        throw "herdr command failed (exit code $LASTEXITCODE): herdr $($ArgList -join ' ')"
-    }
-    return $output
-}
-
-function Get-HerdrJson {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string[]]$ArgList
-    )
-
-    $rawLines = Invoke-HerdrCommand -ArgList $ArgList
-    $rawText = [string]::Join("`n", $rawLines)
-    return $rawText | ConvertFrom-Json
-}
+. (Join-Path $PSScriptRoot 'agentpanel-common.ps1')
+$Config = Get-AgentPanelConfig $StateRoot
+$AgentPanelScriptDirectory = $PSScriptRoot
+$SessionDir = Get-PanelSessionDirectory $StateRoot
+$LedgerFile = Join-Path $SessionDir 'panel-panes.json'
+$FlagFile = Join-Path $SessionDir 'panels-hidden'
+$script:Ledger = @()
+$script:Creates = 0
 
 function Get-PanelLedger {
-    if (-not (Test-Path -LiteralPath $LedgerFile -PathType Leaf)) { return @() }
-    try {
-        $raw = Get-Content -Raw -LiteralPath $LedgerFile -ErrorAction Stop
-        $json = $raw | ConvertFrom-Json -ErrorAction Stop
-        if ($null -eq $json) { return @() }
-        return @($json)
-    }
-    catch {
-        return @()
-    }
+    if (-not (Test-Path -LiteralPath $LedgerFile)) { return @() }
+    $data = Get-Content -LiteralPath $LedgerFile -Raw | ConvertFrom-Json
+    if ($data.version -ne 2) { throw 'Unknown ownership ledger version; refusing to modify panes.' }
+    return @($data.panes)
 }
 
 function Set-PanelLedger {
-    param(
-        [Parameter(Mandatory = $true)]
-        [array]$Ledger
-    )
-
-    try {
-        if ($Ledger.Count -eq 0) {
-            '[]' | Set-Content -LiteralPath $LedgerFile -Encoding ascii
-        }
-        else {
-            ($Ledger | ConvertTo-Json) | Set-Content -LiteralPath $LedgerFile -Encoding ascii
-        }
-    }
-    catch {
-        # Ignore ledger write failures
-    }
+    param([Parameter(Mandatory=$true)][AllowEmptyCollection()][array]$Ledger)
+    Write-AtomicJson -Path $LedgerFile -Value @{version=2; panes=@($Ledger)}
 }
 
-function Add-PanelLedgerEntry {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$PaneId
-    )
-
-    $ledger = @(Get-PanelLedger) + $PaneId
-    Set-PanelLedger -Ledger $ledger
+function Get-AllPanes {
+    $panes = @()
+    foreach ($workspace in (Get-HerdrJson @('workspace','list')).result.workspaces) {
+        $panes += @((Get-HerdrJson @('pane','list','--workspace',$workspace.workspace_id)).result.panes)
+    }
+    return @($panes | Where-Object { $_ -and $_.pane_id })
 }
 
-function Get-KeepPaneIds {
-    if (-not (Test-Path -LiteralPath $KeepFile -PathType Leaf)) { return @() }
-    try {
-        $lines = Get-Content -LiteralPath $KeepFile -ErrorAction Stop
-        return @($lines | ForEach-Object { $_.Trim() } | Where-Object { $_.Length -gt 0 })
-    }
-    catch {
-        return @()
-    }
+function Test-IsAgentPane {
+    param($Pane)
+    return [bool]$Pane.agent
 }
 
-function Close-PaneQuiet {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$PaneId
-    )
-
-    try {
-        $null = & herdr pane close $PaneId 2>$null
-    }
-    catch {
-        # Ignore close failures
-    }
+function Get-OwnedPane {
+    param($Entry, [array]$Panes)
+    # A label is a locator, never sufficient permission to close a pane.
+    return @($Panes | Where-Object { $_.label -eq ('agentpanel:' + $Entry.token) }) | Select-Object -First 1
 }
 
-function Invoke-HiddenModeIteration {
-    # Close every pane the watcher created (from the ledger), then clear it
-    $ledger = Get-PanelLedger
-    foreach ($paneId in $ledger) {
-        if ($paneId) { Close-PaneQuiet -PaneId $paneId }
-    }
-    Set-PanelLedger -Ledger @()
-
-    # Also close any pre-ledger AgentPanel panes, except ones explicitly kept
-    $keepIds = Get-KeepPaneIds
-    try {
-        $workspaceResp = Get-HerdrJson -ArgList @('workspace', 'list')
-        $workspaces = $workspaceResp.result.workspaces
-        if ($workspaces) {
-            foreach ($workspace in $workspaces) {
-                $workspaceId = $workspace.workspace_id
-                if (-not $workspaceId) { continue }
-
-                $allPanes = $null
-                try {
-                    $allPanesResp = Get-HerdrJson -ArgList @('pane', 'list', '--workspace', $workspaceId)
-                    $allPanes = @($allPanesResp.result.panes)
-                }
-                catch {
-                    continue
-                }
-                if (-not $allPanes -or $allPanes.Count -eq 0) { continue }
-
-                foreach ($pane in $allPanes) {
-                    $paneId = $pane.pane_id
-                    if (-not $paneId) { continue }
-                    if ($keepIds -contains $paneId) { continue }
-
-                    try {
-                        $content = Invoke-HerdrCommand -ArgList @('pane', 'read', $paneId, '--lines', '40')
-                        if ($content -and ([string]::Join("`n", $content)) -match $AgentPanelHeaderRegex) {
-                            Close-PaneQuiet -PaneId $paneId
-                        }
-                    }
-                    catch {
-                        # Continue to next pane if read fails
-                    }
-                }
-            }
-        }
-    }
-    catch {
-        # Swallow errors enumerating workspaces/panes in hidden mode
-    }
-
-    $timestamp = Get-Date -Format HH:mm:ss
-    Write-Host "heartbeat $timestamp - panels hidden"
-
-    Invoke-EnsureStatusBoard -FallbackToFirstPane
-}
-
-function Invoke-EnsureStatusBoard {
-    param(
-        [switch]$FallbackToFirstPane
-    )
-
-    $AgentsFeedScriptPath = 'C:\Users\Harshad Vaswani\.herdr\agents-feed.ps1'
-
-    try {
-        $workspaceResp = Get-HerdrJson -ArgList @('workspace', 'list')
-        $workspaces = $workspaceResp.result.workspaces
-        if (-not $workspaces) { return }
-    }
-    catch {
-        return
-    }
-
-    # Order workspaces: focused first (if the field is available), then the rest.
-    $focusedWorkspaces = @($workspaces | Where-Object { $_.focused })
-    $otherWorkspaces = @($workspaces | Where-Object { -not $_.focused })
-    $orderedWorkspaces = @($focusedWorkspaces + $otherWorkspaces)
-
-    # 1. Detection: does a status-board pane already exist anywhere?
-    foreach ($workspace in $orderedWorkspaces) {
-        $workspaceId = $workspace.workspace_id
-        if (-not $workspaceId) { continue }
-
-        $allPanes = $null
+function Test-PanelHealthy {
+    param($Entry)
+    $path = Join-Path $SessionDir ($Entry.token + '.json')
+    if (Test-Path -LiteralPath $path) {
         try {
-            $allPanesResp = Get-HerdrJson -ArgList @('pane', 'list', '--workspace', $workspaceId)
-            $allPanes = @($allPanesResp.result.panes)
+            $beat = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
+            $age = ([DateTime]::UtcNow - [DateTime]::Parse($beat.at).ToUniversalTime()).TotalSeconds
+            $process = Get-Process -Id $beat.process_id -ErrorAction Stop
+            return ($beat.token -eq $Entry.token -and $beat.role -eq $Entry.role -and
+                $process.StartTime.ToUniversalTime().ToString('o') -eq $beat.process_started -and
+                $age -ge 0 -and $age -le $Config.heartbeatSeconds)
+        } catch { return $false }
+    }
+    return (([DateTime]::UtcNow - [DateTime]::Parse($Entry.created_at).ToUniversalTime()).TotalSeconds -lt $Config.creationGraceSeconds)
+}
+
+function Test-CanCloseOwnedPane {
+    param($Entry)
+    try {
+        $pane = (Get-HerdrJson @('pane','get',$Entry.pane_id)).result.pane
+        if (-not $pane -or $pane.label -ne ('agentpanel:' + $Entry.token) -or (Test-IsAgentPane $pane)) { return $false }
+        if ($Config.excludedPanes -contains $pane.pane_id) { return $false }
+        $info = (Get-HerdrJson @('pane','process-info','--pane',$pane.pane_id)).result.process_info
+        if (-not $Entry.shell_pid -or $info.shell_pid -ne $Entry.shell_pid) { return $false }
+        $processes = @(Get-CimInstance Win32_Process -ErrorAction Stop)
+        $shell = $processes | Where-Object { $_.ProcessId -eq $Entry.shell_pid } | Select-Object -First 1
+        if (-not $shell -or $shell.CreationDate.ToUniversalTime().ToString('o') -ne $Entry.shell_started) { return $false }
+        $children = @($processes | Where-Object { $_.ParentProcessId -eq $Entry.shell_pid })
+        foreach ($child in $children) {
+            # Only the exact renderer command launched by us may own the shell.
+            # All its descendants (e.g. a hung ollama probe) belong to that renderer.
+            if ($child.Name -ne 'powershell.exe' -or $child.CommandLine -notmatch '(?i)-EncodedCommand\s+([A-Za-z0-9+/=]+)') { return $false }
+            $decoded = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($Matches[1]))
+            if ($decoded -ne $Entry.command_text) { return $false }
         }
-        catch {
+        return $true
+    } catch { return $false }
+}
+
+function Close-OwnedPane {
+    param($Entry)
+    if (-not (Test-CanCloseOwnedPane $Entry)) {
+        Write-Warning "Leaving pane $($Entry.pane_id): ownership or current process could not be verified."
+        return $false
+    }
+    $null = Invoke-HerdrCommand @('pane','close',$Entry.pane_id)
+    $script:Ledger = @($script:Ledger | Where-Object { $_.token -ne $Entry.token })
+    Set-PanelLedger $script:Ledger
+    $beatPath = Join-Path $SessionDir ($Entry.token + '.json')
+    if (Test-Path -LiteralPath $beatPath) { Remove-Item -LiteralPath $beatPath -Force }
+    return $true
+}
+
+function Set-PanelWidth {
+    param([string]$PaneId)
+    try {
+        $layout = (Get-HerdrJson @('pane','layout','--pane',$PaneId)).result.layout
+        $panel = @($layout.panes | Where-Object { $_.pane_id -eq $PaneId })[0]
+        if (-not $panel) { return }
+        $width = [int]$panel.rect.width
+        if ([Math]::Abs($width - $Config.columns) -lt 2) { return }
+        $split = @($layout.splits | Where-Object {
+            $_.direction -eq 'right' -and $_.rect.x -le $panel.rect.x -and
+            ($_.rect.x + $_.rect.width) -ge ($panel.rect.x + $width) -and
+            $_.rect.y -le $panel.rect.y -and ($_.rect.y + $_.rect.height) -ge ($panel.rect.y + $panel.rect.height)
+        } | Sort-Object { $_.rect.width })[0]
+        if (-not $split -or $panel.rect.x -le $split.rect.x -or $split.rect.width -lt ($Config.columns + $Config.minWorkColumns)) { return }
+        $delta = ($width - $Config.columns) / [double]$split.rect.width
+        $direction = if ($delta -gt 0) { 'right' } else { 'left' }
+        $amount = [Math]::Min(0.3,[Math]::Abs($delta)).ToString([Globalization.CultureInfo]::InvariantCulture)
+        $null = Invoke-HerdrCommand @('pane','resize','--pane',$PaneId,'--direction',$direction,'--amount',$amount)
+    } catch { Write-Warning "Cannot resize panel $PaneId this cycle." }
+}
+
+function New-OwnedPanel {
+    param($Target, [ValidateSet('catalogue','board')][string]$Role, [string]$Direction='right', [double]$Ratio=0.5)
+    if ($script:Creates -ge $Config.maxCreates) { return $null }
+    $file = if ($Role -eq 'board') { 'agents-feed.ps1' } else { 'agents-catalogue.ps1' }
+    $scriptPath = Join-Path $AgentPanelScriptDirectory $file
+    if (-not (Test-Path -LiteralPath $scriptPath)) { throw "Missing renderer $file." }
+    $response = Get-HerdrJson @('pane','split',$Target.pane_id,'--direction',$Direction,
+        '--ratio',$Ratio.ToString([Globalization.CultureInfo]::InvariantCulture),'--cwd',$env:USERPROFILE,'--no-focus')
+    $newId = $response.result.pane.pane_id
+    if (-not $newId) { throw 'Split returned no pane ID.' }
+    # Count the split immediately, including failed launches and board creation.
+    $script:Creates++
+    $token = [Guid]::NewGuid().ToString('N')
+    $command = New-PanelLaunchCommand $scriptPath $StateRoot $token
+    $encoded = ($command -split ' ')[-1]
+    $entry = [pscustomobject]@{ pane_id=$newId; tab_id=$Target.tab_id; role=$Role; token=$token;
+        created_at=[DateTime]::UtcNow.ToString('o'); shell_pid=$null; shell_started=$null;
+        command_text=[Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($encoded)) }
+    $script:Ledger += $entry
+    # Persist before any further operation. An interrupted launch reserves its slot.
+    Set-PanelLedger $script:Ledger
+    try {
+        $entry.shell_pid = (Get-HerdrJson @('pane','process-info','--pane',$newId)).result.process_info.shell_pid
+        if (-not $entry.shell_pid) { throw 'Cannot identify new pane shell.' }
+        $shell = Get-CimInstance Win32_Process -Filter ("ProcessId=" + $entry.shell_pid) -ErrorAction Stop
+        $entry.shell_started = $shell.CreationDate.ToUniversalTime().ToString('o')
+        $null = Invoke-HerdrCommand @('pane','rename',$newId,('agentpanel:' + $token))
+        Set-PanelLedger $script:Ledger
+        $null = Invoke-HerdrCommand @('pane','run',$newId,$command)
+        return $entry
+    } catch {
+        Write-Warning "Panel launch failed in $newId; attempting verified cleanup."
+        $null = Close-OwnedPane $entry
+        return $null
+    }
+}
+
+function Invoke-PanelIteration {
+    $script:Creates = 0
+    $panes = @(Get-AllPanes)
+    $hidden = Test-Path -LiteralPath $FlagFile
+    foreach ($entry in @($script:Ledger)) {
+        $pane = Get-OwnedPane $entry $panes
+        if (-not $pane) {
+            # An unlabelled failed creation remains reserved while its pane exists.
+            $pane = $panes | Where-Object { $_.pane_id -eq $entry.pane_id } | Select-Object -First 1
+            if ($pane) { Write-Warning "Unverified pane $($entry.pane_id) left for manual inspection."; continue }
+            $script:Ledger = @($script:Ledger | Where-Object { $_.token -ne $entry.token })
             continue
         }
-        if (-not $allPanes -or $allPanes.Count -eq 0) { continue }
-
-        foreach ($pane in $allPanes) {
-            $paneId = $pane.pane_id
-            if (-not $paneId) { continue }
-            try {
-                $content = Invoke-HerdrCommand -ArgList @('pane', 'read', $paneId, '--lines', '40')
-                if ($content -and ([string]::Join("`n", $content)) -match 'TEAM ACTIVITY') {
-                    return
-                }
-            }
-            catch {
-                # Continue to next pane if read fails
-            }
-        }
+        $entry.pane_id = $pane.pane_id
+        $entry.tab_id = $pane.tab_id
+        if (($hidden -and $entry.role -eq 'catalogue') -or -not (Test-PanelHealthy $entry)) { $null = Close-OwnedPane $entry }
     }
-
-    # 2. No board pane found anywhere: find a home tab, wherever an AgentPanel already
-    # lives, preferring the focused workspace.
-    $panelPaneId = $null
-    foreach ($workspace in $orderedWorkspaces) {
-        if ($panelPaneId) { break }
-        $workspaceId = $workspace.workspace_id
-        if (-not $workspaceId) { continue }
-
-        $allPanes = $null
-        try {
-            $allPanesResp = Get-HerdrJson -ArgList @('pane', 'list', '--workspace', $workspaceId)
-            $allPanes = @($allPanesResp.result.panes)
-        }
-        catch {
-            continue
-        }
-        if (-not $allPanes -or $allPanes.Count -eq 0) { continue }
-
-        foreach ($pane in $allPanes) {
-            $paneId = $pane.pane_id
-            if (-not $paneId) { continue }
-            try {
-                $content = Invoke-HerdrCommand -ArgList @('pane', 'read', $paneId, '--lines', '40')
-                if ($content -and ([string]::Join("`n", $content)) -match $AgentPanelHeaderRegex) {
-                    $panelPaneId = $paneId
-                    break
-                }
-            }
-            catch {
-                # Continue to next pane if read fails
-            }
-        }
+    Set-PanelLedger $script:Ledger
+    # Remove verified duplicates, but never adopt or close panes based on screen text.
+    foreach ($group in @($script:Ledger | Group-Object { if ($_.role -eq 'board') { 'board' } else { $_.tab_id } })) {
+        foreach ($extra in @($group.Group | Select-Object -Skip 1)) { $null = Close-OwnedPane $extra }
     }
-
-    # In hidden mode there may be no panel pane at all (they were all closed above).
-    # Fall back to the first pane of the focused workspace's first tab, so the board
-    # still exists as the "restore" button.
-    if ((-not $panelPaneId) -and $FallbackToFirstPane -and $orderedWorkspaces.Count -gt 0) {
-        try {
-            $fallbackWorkspaceId = $orderedWorkspaces[0].workspace_id
-            if ($fallbackWorkspaceId) {
-                $tabResp = Get-HerdrJson -ArgList @('tab', 'list', '--workspace', $fallbackWorkspaceId)
-                $tabs = $tabResp.result.tabs
-                if ($tabs -and $tabs.Count -gt 0) {
-                    $firstTabId = $tabs[0].tab_id
-                    $allPanesResp = Get-HerdrJson -ArgList @('pane', 'list', '--workspace', $fallbackWorkspaceId)
-                    $allPanes = @($allPanesResp.result.panes)
-                    $tabPanes = @($allPanes | Where-Object { $_.tab_id -eq $firstTabId })
-                    if ($tabPanes.Count -gt 0) {
-                        $panelPaneId = $tabPanes[0].pane_id
-                    }
-                }
-            }
-        }
-        catch {
-            # Give up silently this cycle
-        }
-    }
-
-    if (-not $panelPaneId) { return }
-
-    try {
-        $splitResp = Get-HerdrJson -ArgList @('pane', 'split', $panelPaneId, '--direction', 'down', '--ratio', '0.5', '--no-focus')
-        $newPaneId = $splitResp.result.pane.pane_id
-        if ($newPaneId) {
-            $runCommand = "powershell -NoProfile -ExecutionPolicy Bypass -File '$AgentsFeedScriptPath' -PaneId $newPaneId"
-            $null = Invoke-HerdrCommand -ArgList @('pane', 'run', $newPaneId, $runCommand)
-        }
-    }
-    catch {
-        # Give up silently this cycle
-    }
-}
-
-function Invoke-EnsureAgentPanelIteration {
-    $workspaceResp = Get-HerdrJson -ArgList @('workspace', 'list')
-    $workspaces = $workspaceResp.result.workspaces
-    if (-not $workspaces) { return }
-
-    $totalTabsChecked = 0
-    $totalPanelsCreated = 0
-
-    foreach ($workspace in $workspaces) {
-        $workspaceId = $workspace.workspace_id
-        if (-not $workspaceId) { continue }
-
-        $tabResp = Get-HerdrJson -ArgList @('tab', 'list', '--workspace', $workspaceId)
-        $tabs = $tabResp.result.tabs
-        if (-not $tabs -or $tabs.Count -eq 0) { continue }
-
-        # pane list has no --tab flag: fetch once per workspace, filter per tab below
-        $allPanes = $null
-        try {
-            $allPanesResp = Get-HerdrJson -ArgList @('pane', 'list', '--workspace', $workspaceId)
-            $allPanes = @($allPanesResp.result.panes)
-        }
-        catch {
-            continue
-        }
-        if (-not $allPanes -or $allPanes.Count -eq 0) { continue }
-
-        # Iterate ALL tabs (not just first)
-        foreach ($tab in $tabs) {
-            # Safety cap: never create more than 3 panels in one cycle
-            if ($totalPanelsCreated -ge 3) { break }
-
-            $totalTabsChecked++
-            $tabId = $tab.tab_id
-            if (-not $tabId) { continue }
-
-            $tabPanes = @($allPanes | Where-Object { $_.tab_id -eq $tabId })
-            if ($tabPanes.Count -eq 0) { continue }
-
-            # Check if AgentPanel exists in this tab
-            $panelFound = $false
-            foreach ($pane in $tabPanes) {
-                try {
-                    $content = Invoke-HerdrCommand -ArgList @('pane', 'read', $pane.pane_id, '--lines', '40')
-                    if ($content -and ([string]::Join("`n", $content)) -match $AgentPanelHeaderRegex) {
-                        $panelFound = $true
-                        break
-                    }
-                }
-                catch {
-                    # Continue to next pane if read fails
-                }
-            }
-
-            if ($panelFound) {
-                $script:RecentPanelCreations.Remove($tabId)
+    $panes = @(Get-AllPanes)
+    if (-not $hidden) {
+        foreach ($tab in @($panes | Group-Object tab_id)) {
+            $existing = @($script:Ledger | Where-Object { $_.tab_id -eq $tab.Name -and $_.role -eq 'catalogue' })
+            if ($existing.Count) {
+                if (Test-CanCloseOwnedPane $existing[0]) { Set-PanelWidth $existing[0].pane_id }
                 continue
             }
-
-            # Recently created a panel here that hasn't rendered its header yet?
-            # Give it the grace period before concluding the tab needs another.
-            if ($script:RecentPanelCreations.ContainsKey($tabId)) {
-                if (((Get-Date) - $script:RecentPanelCreations[$tabId]).TotalSeconds -lt $CreationGraceSeconds) {
-                    continue
-                }
-                $script:RecentPanelCreations.Remove($tabId)
+            if ($script:Creates -ge $Config.maxCreates) { break }
+            $board = $script:Ledger | Where-Object { $_.tab_id -eq $tab.Name -and $_.role -eq 'board' } | Select-Object -First 1
+            if ($board -and (Test-CanCloseOwnedPane $board)) {
+                $target = $panes | Where-Object { $_.pane_id -eq $board.pane_id } | Select-Object -First 1
+                $new = New-OwnedPanel $target 'catalogue' 'down' 0.5
+                if ($new) { $null = Invoke-HerdrCommand @('pane','swap','--source-pane',$new.pane_id,'--target-pane',$board.pane_id) }
+                continue
             }
-
-            # Create panel in this tab: split the WIDEST pane, not the first one —
-            # the first pane may be a narrow sidebar, and skipping on its width
-            # would make the watcher skip the tab forever.
-            $targetPaneId = $tabPanes[0].pane_id
-
-            # Ratio is relative to the pane BEING SPLIT, not the tab area:
-            # use the target pane's own current width so the new pane gets exactly 49.
-            $ratio = 0.64
-            try {
-                $layoutResp = Get-HerdrJson -ArgList @('pane', 'layout', '--pane', $targetPaneId)
-                $tabPaneIds = @($tabPanes | ForEach-Object { $_.pane_id })
-                $widestPane = $null
-                foreach ($lp in $layoutResp.result.layout.panes) {
-                    if ($tabPaneIds -contains $lp.pane_id) {
-                        if ($null -eq $widestPane -or $lp.rect.width -gt $widestPane.rect.width) { $widestPane = $lp }
-                    }
-                }
-                $targetWidth = $null
-                if ($null -ne $widestPane) {
-                    $targetPaneId = $widestPane.pane_id
-                    $targetWidth = $widestPane.rect.width
-                }
-                if ($null -ne $targetWidth -and $targetWidth -gt 55) {
-                    $ratio = [math]::Round(1 - (49 / $targetWidth), 4)
-                } elseif ($null -ne $targetWidth) {
-                    # Even the widest pane is too narrow to host a 49-col panel; skip this tab this cycle.
-                    continue
-                }
-            }
-            catch {
-                # Fall back to default ratio on error
-            }
-
-            try {
-                $splitResp = Get-HerdrJson -ArgList @('pane', 'split', $targetPaneId, '--direction', 'right', '--ratio', $ratio.ToString(), '--no-focus')
-                $newPaneId = $splitResp.result.pane.pane_id
-                if ($newPaneId) {
-                    $null = Invoke-HerdrCommand -ArgList @('pane', 'run', $newPaneId, $AgentPanelLaunchCommand)
-                    $totalPanelsCreated++
-                    Add-PanelLedgerEntry -PaneId $newPaneId
-                    $script:RecentPanelCreations[$tabId] = Get-Date
-                }
-            }
-            catch {
-                # Skip this tab if split or run fails
-            }
+            $layout = (Get-HerdrJson @('pane','layout','--pane',$tab.Group[0].pane_id)).result.layout
+            $eligible = @($tab.Group | Where-Object { $Config.excludedPanes -notcontains $_.pane_id -and $_.agent_status -notin @('working','blocked') })
+            $ids = @($eligible | ForEach-Object { $_.pane_id })
+            $widest = $layout.panes | Where-Object { $ids -contains $_.pane_id } | Sort-Object { $_.rect.width } -Descending | Select-Object -First 1
+            if (-not $widest -or $widest.rect.width -lt ($Config.columns + $Config.minWorkColumns + 1)) { continue }
+            $target = $eligible | Where-Object { $_.pane_id -eq $widest.pane_id } | Select-Object -First 1
+            $null = New-OwnedPanel $target 'catalogue' 'right' (1 - ($Config.columns / [double]$widest.rect.width))
         }
     }
-
-    # Heartbeat at end of cycle
-    $timestamp = Get-Date -Format HH:mm:ss
-    Write-Host "heartbeat $timestamp - checked $totalTabsChecked tabs, created $totalPanelsCreated panels"
-
-    Invoke-EnsureStatusBoard
+    # A board is global within this session and remains the restore control.
+    if (-not @($script:Ledger | Where-Object { $_.role -eq 'board' }).Count -and $script:Creates -lt $Config.maxCreates) {
+        $panes = @(Get-AllPanes)
+        $catalogue = $script:Ledger | Where-Object { $_.role -eq 'catalogue' } | Select-Object -First 1
+        $target = $null
+        if ($catalogue -and (Test-CanCloseOwnedPane $catalogue)) { $target = $panes | Where-Object { $_.pane_id -eq $catalogue.pane_id } | Select-Object -First 1 }
+        if (-not $target) { $target = $panes | Where-Object { $Config.excludedPanes -notcontains $_.pane_id -and $_.agent_status -notin @('working','blocked') } | Select-Object -First 1 }
+        if ($target) { $null = New-OwnedPanel $target 'board' 'down' 0.5 }
+    }
+    $message = "heartbeat $([DateTime]::Now.ToString('HH:mm:ss')) - hidden=$hidden, splits=$script:Creates, owned=$($script:Ledger.Count)"
+    Write-Host $message
+    Write-AtomicJson -Path (Join-Path $SessionDir 'watcher-health.json') -Value @{ at=[DateTime]::UtcNow.ToString('o'); message=$message }
 }
 
-while ($true) {
-    try {
-        if (Test-Path -LiteralPath $FlagFile -PathType Leaf) {
-            Invoke-HiddenModeIteration
+if ($env:HERDR_ENV -ne '1') { throw 'Run the watcher from a Herdr pane.' }
+[IO.Directory]::CreateDirectory($SessionDir) | Out-Null
+$mutex = New-Object Threading.Mutex($false, ('Local\AgentPanel-Watcher-' + (Get-StateKey $SessionDir.ToLowerInvariant())))
+$held = $false
+try {
+    try { $held = $mutex.WaitOne(0) } catch [Threading.AbandonedMutexException] { $held=$true }
+    if (-not $held) { Write-Host 'A watcher is already running for this session.'; return }
+    $script:Ledger = @(Get-PanelLedger)
+    do {
+        if (Test-Path -LiteralPath (Join-Path $SessionDir 'disabled')) {
+            foreach ($entry in @($script:Ledger)) { $null = Close-OwnedPane $entry }
+            break
         }
-        else {
-            Invoke-EnsureAgentPanelIteration
+        try { Invoke-PanelIteration }
+        catch {
+            Write-Warning $_.Exception.Message
+            Write-AtomicJson -Path (Join-Path $SessionDir 'watcher-health.json') -Value @{ at=[DateTime]::UtcNow.ToString('o'); error=$_.Exception.Message }
         }
-    }
-    catch {
-        # Swallow all errors for this iteration (server down, JSON parse failure,
-        # transient herdr CLI error, etc.) so the watcher loop never dies.
-    }
-
-    Start-Sleep -Seconds $PollSeconds
-}
+        if (-not $Once) { Start-Sleep -Seconds $Config.pollSeconds }
+    } while (-not $Once)
+} finally { if ($held) { $mutex.ReleaseMutex() }; $mutex.Dispose() }

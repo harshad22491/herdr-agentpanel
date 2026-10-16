@@ -1,5 +1,15 @@
 # Layout Threat Assessment (merged)
 
+> Historical incident record from August 2026. The September implementation now
+> uses per-session ownership records, renderer heartbeats, verified process checks,
+> singleton startup, bounded creation, explicit probe allow-lists and atomic state
+> writes. It retains width correction and board-column restoration. The activity
+> board no longer resizes itself. See the current README and USER-GUIDE.md for setup;
+> mitigation suggestions and accepted fragilities below describe the old version.
+> Remaining limits: native Windows only; no live-layout proof from mocked tests;
+> inaccessible ownership evidence leaves panes for manual inspection; plugin hooks
+> are event-driven rather than an OS-level supervisor.
+
 Sources: Grok red-team (architecture-specific, ~\.herdr\threats-grok.md), Copilot ops list
 (~\.herdr\threats-copilot.md), and incidents actually observed on 2026-08-28. Ranked by
 (likelihood x impact), incident-verified items marked [SEEN TODAY].

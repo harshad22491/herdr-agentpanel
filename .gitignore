@@ -1,1 +1,8 @@
+agentpanel.json
+limits.json
+agents-status.json
+agent-tasks/
+task-results/
+agentpanel-state/
+*.tmp
 **/target/

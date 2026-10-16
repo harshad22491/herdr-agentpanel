@@ -1,0 +1,6 @@
+{
+  "agents": {
+    "reviewer": { "desc": "Checking the login changes", "eta": "5 minutes" }
+  },
+  "next": { "task": "Run the checks", "agent": "tester", "eta": "2 minutes" }
+}

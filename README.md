@@ -3,22 +3,6 @@
 A Windows dashboard for Herdr workspaces: assistant readiness, recent quota readings,
 team activity, and task agents using OpenRouter.
 
-<<<<<<< HEAD
-Built (and battle-tested the hard way) with PowerShell 5.1 and the `herdr` CLI only —
-no other dependencies for the dashboard. The optional bundled sidebar is a Rust
-plugin with its own build requirements.
-
-## Project-aware sidebar
-
-`plugins/herdr-sidebar/` contains our modified version of
-[Alex Arthurs' herdr-sidebar](https://github.com/alexarthurs/herdr-sidebar).
-It automatically follows the working pane's directory on Windows and keeps
-the file explorer and Git view on the same project, including when spaces reuse
-the same name. AgentPanel utility panes do not override the project directory.
-
-See the [sidebar installation and change notes](plugins/herdr-sidebar/README.md).
-The dashboard scripts and watcher remain separate and are not replaced.
-=======
 **Start with the [plain-language setup guide](docs/USER-GUIDE.md).**
 
 This release uses Windows PowerShell 5.1 and the Herdr CLI. It is not a Linux/WSL
@@ -63,7 +47,17 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$env:USERPROFILE\.herdr
 For old installations, stop the old watcher/scheduled task and close old panels
 before enabling this version. See the guide's upgrade instructions. Legacy pane-ID
 ledgers and screen headers are never adopted as authority to close panes.
->>>>>>> 94805bb (v4: shared common modules, installer, start/stop scripts, OpenRouter task runner, tests and docs)
+
+## Project-aware sidebar
+
+`plugins/herdr-sidebar/` contains our modified version of
+[Alex Arthurs' herdr-sidebar](https://github.com/alexarthurs/herdr-sidebar).
+It automatically follows the working pane's directory on Windows and keeps
+the file explorer and Git view on the same project, including when spaces reuse
+the same name. AgentPanel utility panes do not override the project directory.
+
+See the [sidebar installation and change notes](plugins/herdr-sidebar/README.md).
+The dashboard scripts and watcher remain separate and are not replaced.
 
 ## Components
 
@@ -177,7 +171,6 @@ instructions about screen detection, arbitrary quota panes and board resizing.
 
 ## Credits
 
-<<<<<<< HEAD
 The bundled sidebar is based on **Alex Arthurs'
 [herdr-sidebar](https://github.com/alexarthurs/herdr-sidebar)**, upstream commit
 `13ebde8d631494f1273d8c5e3503a755047c1267` (0.10.0). Its source, screenshots,
@@ -187,11 +180,5 @@ This repository adds the project-directory-following fixes described in the
 [sidebar change notes](plugins/herdr-sidebar/UPSTREAM.md); it does not claim
 authorship of the original sidebar.
 
-Built by a multi-agent team orchestrated from Claude Code: Claude Fable (manager/reviewer),
-Claude Sonnet and Haiku subagents (build, fixes, verification), OpenAI Codex (catalogue v2,
-code review), GitHub Copilot (ops threat list), Grok (red-team), and a local
-Ollama/qwen2.5:3b (text piecework). Human direction throughout by the repo owner.
-=======
 Originally built by a multi-agent team coordinated by the repository owner.
 See the project history for contributions. MIT licensed.
->>>>>>> 94805bb (v4: shared common modules, installer, start/stop scripts, OpenRouter task runner, tests and docs)
